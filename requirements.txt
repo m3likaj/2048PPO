@@ -1,0 +1,13 @@
+# Core (torch is preinstalled on Kaggle and most HPC images; any torch >= 2.0
+# with CUDA works. Tested with torch 2.13 / numpy 1.26 / python 3.12.)
+torch>=2.0
+numpy>=1.24
+
+# Original optimizer: heavyball ForeachMuon with heavyball_momentum=True.
+# heavyball 3.x removed ForeachMuon, so this pin is required for the exact
+# original optimizer. (Fallback: `python train.py --optimizer adam`.)
+heavyball==2.1.4
+
+# Optional
+# wandb          # only if you pass --wandb
+# pytest         # test_exactness.py also runs standalone via python
