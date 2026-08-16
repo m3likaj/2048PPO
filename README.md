@@ -25,6 +25,7 @@ max-tile average ≈ 40 981, with a ~3.47 M-parameter network.
 | `config.py` | every hyperparameter, with per-value source comments | `pufferlib/config/ocean/g2048.ini` + `config/default.ini` |
 | `test_exactness.py` | 14 tests proving the port matches the C semantics | — |
 | `reference/` | verbatim `g2048.h`, `g2048.ini`, `LICENSE` from the branch | — |
+| `plot_training.py` | milestone (earned/scaffolded), loss, EV, and run plots | — |
 | `kaggle_2048.ipynb` | ready-to-run Kaggle notebook | — |
 | `run_hpc.sbatch` | single-GPU SLURM job script | — |
 
@@ -93,6 +94,44 @@ PuffeRL does). Kaggle sessions are time-limited, so train in chunks with
 `--resume`; checkpoints land in `--data-dir` every `checkpoint_interval`
 (200) epochs and in `latest.pt` (full state).
 
+## Earned-tile tracking, reports, and plots (addition)
+
+The original `add_log` **skips scaffolding episodes**, so it cannot tell you
+whether a milestone tile was built by the agent or handed to it. This port
+adds a logging-only sidecar that fixes that without touching training:
+
+- **Earned rule.** `earned_max_tile` is the largest exponent **created by a
+  merge** during the episode. Any merge result counts as earned — including
+  when one parent was a scaffolded placement (earned 8192 + scaffolded 8192
+  → the 16384 is earned). Only tiles that exist purely because scaffolding
+  placed them are un-earned. Implemented via a merge-max column in the row
+  table: zero RNG consumption, zero reward/observation change, and the
+  original log stream (`perf`, `score`, `reached_*`, lifetime updates) is
+  byte-identical.
+- **Extended log.** Every finished episode (normal *and* scaffold) is
+  tallied separately: counts, per-milestone `reached` (max tile ≥ m, the
+  original definition) and `earned` (earned max ≥ m) for
+  8192/16384/32768/65536/131072, plus max-tile, earned-max-tile, episode
+  length, and merge-score sums per class. Raw sums land in `log.csv` as
+  `x/...` columns.
+- **`report.txt`** — ~20 evenly spaced human-readable progress blocks per
+  run (`total_epochs // 20`), each with timestamp, epoch/step/elapsed,
+  cumulative episode counts (normal/scaffold), merge score, EV, average max
+  tile, average *earned* max tile, and per-milestone earned / reached /
+  scaffold-only percentages **with raw counts** so a 0.002 % rate is never
+  rounded to zero. Counters persist through `--resume`.
+- **`plot_training.py`** — `python plot_training.py --csv <run>/log.csv`
+  (also auto-runs at training end) produces per-milestone
+  earned-vs-reached-vs-scaffold-only curves (with the original
+  normal-episodes-only reached rate dashed for comparability), loss curves,
+  explained variance, average max tile (log₂ scale, earned vs raw), merge
+  score, episode length by class, learning rate, and throughput — the full
+  set you'd want for a write-up.
+
+Definition note: "reached" keeps the original `max_tile` semantics
+(recomputed on valid moves), so an episode terminated purely by invalid
+moves logs `max_tile = 0` exactly as the C code would.
+
 ## Deviations from the original (complete list)
 
 Everything not listed here is a faithful recreation. These are the only
@@ -138,6 +177,11 @@ differences, all forced by the port target or disclosed conveniences:
    `log.csv` (+ optional wandb). Logged quantities and their definitions
    (per-episode means over 128-step flush windows, weighted by `n`) match
    the original.
+11. **Earned-tile tracking (user-requested addition).** Merge-provenance
+   tracker, all-episode extended log split normal/scaffold, `report.txt`
+   (~20 progress blocks), and `plot_training.py`. Logging-only: no RNG,
+   reward, observation, or optimizer-path change; the original log stream
+   is unchanged (verified by tests).
 
 ## Plugging in a transformer later
 

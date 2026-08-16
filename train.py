@@ -128,6 +128,13 @@ class Trainer:
         self.global_step = 0
         self.stats = defaultdict(list)
         self.last_stats = {}
+        # Extended earned/scaffold tracking (addition, logging-only):
+        # window sums since the last CSV row, and cumulative sums for the
+        # 20-report progress file. Keys come from the env's xlog.
+        self.xwin = defaultdict(float)
+        self.xcum = defaultdict(float)
+        self.reports_written = 0
+        self.run_started = time.time()
 
         # First recv: reset obs with zero reward/terminal (async_reset).
         self.obs = self.env.reset(seed=cfg['seed'])
@@ -169,6 +176,11 @@ class Trainer:
             self.prev_done = terminal.float()
 
             if info is not None:
+                xs = info.pop('xstats', None)
+                if xs is not None:
+                    for k, v in xs.items():
+                        self.xwin[k] += v
+                        self.xcum[k] += v
                 for k, v in info.items():
                     self.stats[k].append(v)
 
@@ -287,6 +299,55 @@ class Trainer:
         self.stats = defaultdict(list)
         return self.last_stats
 
+    def write_report(self, report_path, losses):
+        """Append one human-readable progress line (of ~20 total per run).
+
+        Cumulative earned/reached milestone percentages come WITH raw counts
+        so tiny rates (e.g. 0.002%) are never rounded away.
+        """
+        C = self.xcum
+        n_norm, n_scaf = C['xn_norm'], C['xn_scaf']
+        n_all = n_norm + n_scaf
+        elapsed = time.time() - self.run_started
+
+        def cnt(prefix, m):
+            return C[f'{prefix}{m}_norm'] + C[f'{prefix}{m}_scaf']
+
+        def pct(x):
+            return 100.0 * x / max(n_all, 1.0)
+
+        avg_max_norm = C['xsum_maxtile_norm'] / max(n_norm, 1.0)
+        avg_earned_all = ((C['xsum_earnedmax_norm'] + C['xsum_earnedmax_scaf'])
+                          / max(n_all, 1.0))
+        merge_score_norm = C['xsum_mergescore_norm'] / max(n_norm, 1.0)
+        ep_len_all = ((C['xsum_len_norm'] + C['xsum_len_scaf'])
+                      / max(n_all, 1.0))
+        ev = losses.get('explained_variance', float('nan'))
+
+        self.reports_written += 1
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        lines = [
+            f"[{ts}] report {self.reports_written:2d} | "
+            f"epoch {self.epoch}/{self.cfg['total_epochs']} | "
+            f"step {self.global_step:.4e} | elapsed {elapsed/3600:.2f}h",
+            f"  episodes {n_all:,.0f} (normal {n_norm:,.0f} / "
+            f"scaffold {n_scaf:,.0f}) | avg ep len {ep_len_all:.1f}",
+            f"  score(merge, normal eps) {merge_score_norm:,.1f} | "
+            f"EV {ev:.4f} | AvgMaxTile(normal) {avg_max_norm:,.1f} | "
+            f"AvgEarnedMaxTile(all) {avg_earned_all:,.1f}",
+        ]
+        for label, m in (('8k', 13), ('16k', 14), ('32k', 15),
+                         ('65k', 16), ('131k', 17)):
+            e, r = cnt('xe', m), cnt('xr', m)
+            lines.append(
+                f"  {label:>4}: earned {pct(e):8.4f}% (n={e:,.0f})   "
+                f"reached {pct(r):8.4f}% (n={r:,.0f})   "
+                f"scaffold-only {pct(r - e):8.4f}% (n={r - e:,.0f})")
+        block = '\n'.join(lines) + '\n'
+        with open(report_path, 'a') as f:
+            f.write(block)
+        print(block, end='', flush=True)
+
     def checkpoint(self, name):
         os.makedirs(self.run_dir, exist_ok=True)
         path = os.path.join(self.run_dir, name)
@@ -296,6 +357,8 @@ class Trainer:
             'scheduler': self.scheduler.state_dict(),
             'epoch': self.epoch,
             'global_step': self.global_step,
+            'xcum': dict(self.xcum),
+            'reports_written': self.reports_written,
             'config': {k: v for k, v in self.cfg.items()},
         }, path)
         # latest.pt duplicates the full state so --resume (added for
@@ -306,6 +369,8 @@ class Trainer:
             'scheduler': self.scheduler.state_dict(),
             'epoch': self.epoch,
             'global_step': self.global_step,
+            'xcum': dict(self.xcum),
+            'reports_written': self.reports_written,
             'config': {k: v for k, v in self.cfg.items()},
         }, os.path.join(self.run_dir, 'latest.pt'))
         return path
@@ -382,6 +447,9 @@ def main():
             trainer.epoch = ckpt['epoch']
             trainer.global_step = ckpt.get('global_step',
                                            trainer.epoch * cfg['batch_size'])
+            for k, v in ckpt.get('xcum', {}).items():
+                trainer.xcum[k] = v
+            trainer.reports_written = ckpt.get('reports_written', 0)
         else:
             print('WARNING: checkpoint has no optimizer state '
                   '(policy-only file); counters start from 0. '
@@ -395,6 +463,12 @@ def main():
     last_time, last_step = time.time(), trainer.global_step
     csv_path = os.path.join(run_dir, 'log.csv')
     csv_header_written = os.path.exists(csv_path)
+    report_path = os.path.join(run_dir, 'report.txt')
+    # ~20 evenly spaced progress reports over the whole schedule.
+    report_interval = max(1, cfg['total_epochs'] // 20)
+
+    xkeys = trainer.env._xlog_keys
+    last_report_epoch = -1
 
     while trainer.global_step < cfg['total_timesteps']:
         trainer.evaluate()
@@ -414,7 +488,9 @@ def main():
                 'lr': lr,
                 **{f'loss/{k}': v for k, v in losses.items()},
                 **{f'env/{k}': v for k, v in stats.items()},
+                **{f'x/{k}': trainer.xwin.get(k, 0.0) for k in xkeys},
             }
+            trainer.xwin = defaultdict(float)
             msg = (f"epoch {trainer.epoch:6d} | step {trainer.global_step:.3e} "
                    f"| SPS {int(sps):8,d} | lr {lr:.2e}")
             if stats:
@@ -435,7 +511,8 @@ def main():
                         'reached_131072', 'n']
             fieldnames = (['epoch', 'global_step', 'sps', 'lr']
                           + [f'loss/{k}' for k in loss_keys]
-                          + [f'env/{k}' for k in env_keys])
+                          + [f'env/{k}' for k in env_keys]
+                          + [f'x/{k}' for k in xkeys])
             with open(csv_path, 'a', newline='') as f:
                 w = _csv.DictWriter(f, fieldnames=fieldnames, restval='',
                                     extrasaction='ignore')
@@ -444,12 +521,25 @@ def main():
                     csv_header_written = True
                 w.writerow(line)
 
+        if trainer.epoch % report_interval == 0:
+            trainer.write_report(report_path, losses)
+            last_report_epoch = trainer.epoch
+
         if trainer.epoch % cfg['checkpoint_interval'] == 0:
             path = trainer.checkpoint(f'model_{trainer.epoch:06d}.pt')
             print(f'checkpoint -> {path}', flush=True)
 
+    if last_report_epoch != trainer.epoch:
+        trainer.write_report(report_path, losses)   # final report
     path = trainer.checkpoint(f'model_{trainer.epoch:06d}_final.pt')
     print(f'Training complete. Final checkpoint -> {path}')
+    try:
+        from plot_training import make_plots
+        outs = make_plots(csv_path, os.path.join(run_dir, 'plots'))
+        print(f'Wrote {len(outs)} plots -> {os.path.join(run_dir, "plots")}')
+    except Exception as e:      # plotting must never kill a finished run
+        print(f'(plots skipped: {e}; run `python plot_training.py '
+              f'--csv {csv_path}` later)')
     if wandb_run is not None:
         wandb_run.finish()
 

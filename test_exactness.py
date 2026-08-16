@@ -39,11 +39,13 @@ def independent_merge(row):
     """
     vals = [v for v in row if v != 0]
     out, reward, score = [], 0.0, 0
+    merged_max = 0
     i = 0
     while i < len(vals):
         if i + 1 < len(vals) and vals[i] == vals[i + 1]:
             new = vals[i] + 1
             out.append(new)
+            merged_max = max(merged_max, new)
             score += 2 ** new
             if new <= 6:
                 reward += MERGE_BASE_REWARD
@@ -55,11 +57,11 @@ def independent_merge(row):
             i += 1
     out += [0] * (4 - len(out))
     moved = out != list(row)
-    return out, reward, score, moved
+    return out, reward, score, moved, merged_max
 
 
 def test_all_rows_vs_independent_oracle():
-    rows, rewards, scores, moved = build_left_tables()
+    rows, rewards, scores, moved, merge_max = build_left_tables()
     n = 18 ** 4
     for idx in range(n):
         r = idx
@@ -67,12 +69,14 @@ def test_all_rows_vs_independent_oracle():
         c2 = r % 18; r //= 18
         c1 = r % 18; r //= 18
         row = [r, c1, c2, c3]
-        o_row, o_rew, o_sc, o_mv = independent_merge(row)
+        o_row, o_rew, o_sc, o_mv, o_mm = independent_merge(row)
         assert list(rows[idx]) == o_row, (row, list(rows[idx]), o_row)
         assert abs(float(rewards[idx]) - np.float32(o_rew)) < 1e-6, (row, rewards[idx], o_rew)
         assert int(scores[idx]) == o_sc, (row, scores[idx], o_sc)
         assert bool(moved[idx]) == o_mv, (row, moved[idx], o_mv)
-    print(f"  all {n} rows match the independent oracle")
+        assert int(merge_max[idx]) == o_mm, (row, merge_max[idx], o_mm)
+    print(f"  all {n} rows match the independent oracle "
+          "(incl. merged-max for the earned tracker)")
 
 
 def test_known_rows():
@@ -110,6 +114,7 @@ def reference_move(board, direction):
     """Direct transliteration of move() from g2048.h on a 4x4 python grid."""
     g = [row[:] for row in board]
     moved, reward, score = False, 0.0, 0
+    merged = []
     for line in range(4):
         if direction == 0:      # UP:    temp[i] = grid[i][col]
             temp = [g[i][line] for i in range(4)]
@@ -119,7 +124,7 @@ def reference_move(board, direction):
             temp = [g[line][i] for i in range(4)]
         else:                   # RIGHT: temp[i] = grid[row][SIZE-1-i]
             temp = [g[line][3 - i] for i in range(4)]
-        new, rew, sc, mv = slide_and_merge_row(temp)
+        new, rew, sc, mv = slide_and_merge_row(temp, merged)
         reward += rew
         score += sc
         moved |= mv
@@ -132,7 +137,7 @@ def reference_move(board, direction):
                 g[line][i] = new[i]
             else:
                 g[line][3 - i] = new[i]
-    return g, reward, score, moved
+    return g, reward, score, moved, (max(merged) if merged else 0)
 
 
 def test_env_moves_match_reference():
@@ -147,16 +152,18 @@ def test_env_moves_match_reference():
         env = G2048TorchEnv(num_envs=n_boards, scaffolding_ratio=0.0, seed=7)
         env.boards = torch.as_tensor(boards.copy())
         actions = torch.full((n_boards,), direction)
-        moved, reward, score = env._apply_moves(actions)
+        moved, reward, score, merge_max = env._apply_moves(actions)
 
         for b in range(n_boards):
-            ref_g, ref_rew, ref_sc, ref_mv = reference_move(boards[b].tolist(), direction)
+            ref_g, ref_rew, ref_sc, ref_mv, ref_mm = reference_move(
+                boards[b].tolist(), direction)
             assert env.boards[b].tolist() == ref_g, (direction, b)
             assert abs(float(reward[b]) - np.float32(ref_rew)) < 1e-5, (direction, b)
             assert int(score[b]) == ref_sc, (direction, b)
             assert bool(moved[b]) == ref_mv, (direction, b)
+            assert int(merge_max[b]) == ref_mm, (direction, b)
     print("  vectorized moves match the C move() transliteration "
-          "for all 4 directions (200 random boards each)")
+          "for all 4 directions (200 random boards each, incl. merged-max)")
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +298,11 @@ def test_add_log_skips_scaffolding_and_updates_lifetime():
     env.reset()
     env.tick[:] = 10**7  # force terminal via tick limit on next step
     env.step(torch.zeros(8, dtype=torch.long))
-    assert env.pop_logs() is None
+    logs = env.pop_logs()
+    # Original stream stays empty for scaffolding episodes (no 'n' key);
+    # only the extended sidecar sees them.
+    assert logs is not None and 'n' not in logs
+    assert logs['xstats']['xn_scaf'] == 8 and logs['xstats']['xn_norm'] == 0
     assert int(env.lifetime_max_tile.max()) == 0
 
     # Non-scaffolding episodes: logged, lifetime updated to episode max tile.
@@ -313,6 +324,72 @@ def test_add_log_skips_scaffolding_and_updates_lifetime():
     assert abs(logs['perf'] - perf) < 1e-9
     print("  add_log: scaffolding episodes skipped; lifetime/perf/score/"
           "reached_* logged exactly for real episodes")
+
+
+def test_earned_tracking_rule():
+    """User rule: ANY merge result is earned, even with a scaffolded parent.
+    e.g. earned 8192 + scaffolded 8192 -> the 16384 is earned."""
+    board = np.zeros((1, 4, 4), dtype=np.uint8)
+    board[0, 0] = [13, 13, 0, 0]      # two 8192s (one imagined scaffolded)
+    env = _fixed_env(board.copy())
+    env.is_scaffolding[:] = True       # provenance is irrelevant to the rule
+    env.step(torch.tensor([2]))        # LEFT: 8192+8192 -> 16384
+    assert int(env.earned_max_tile[0]) == 14
+    # A later smaller merge must not lower it
+    env.boards[0] = 0
+    env.boards[0, 1] = torch.tensor([1, 1, 0, 0], dtype=torch.uint8)
+    env.step(torch.tensor([2]))
+    assert int(env.earned_max_tile[0]) == 14
+    # Invalid move leaves it untouched
+    env.boards[0] = torch.tensor([[1, 2, 3, 4]] * 4, dtype=torch.uint8)
+    env.step(torch.tensor([2]))
+    assert int(env.earned_max_tile[0]) == 14
+    # Reset clears it
+    env._reset_envs(torch.tensor([0]))
+    assert int(env.earned_max_tile[0]) == 0
+    print("  earned rule: merge => earned (scaffolded parent ok); "
+          "monotone; invalid move no-op; cleared on reset")
+
+
+def test_xlog_split_and_counts():
+    """Extended log: ALL episodes tallied, split normal/scaffold, with
+    earned vs reached milestones; original log stream unaffected."""
+    env = G2048TorchEnv(num_envs=2, scaffolding_ratio=0.0, seed=21,
+                        log_interval=10**9)
+    env.reset()
+    # env 0: scaffold-style episode, max tile 15 all from placement (earned 0)
+    # env 1: normal episode that EARNED a 14
+    env.is_scaffolding[:] = torch.tensor([True, False])
+    env.max_tile[:] = torch.tensor([15, 14])
+    env.earned_max_tile[:] = torch.tensor([0, 14])
+    env.score[:] = torch.tensor([100, 200])
+    # Stuck full board: the UP move is invalid (max_tile untouched) and
+    # game-over terminates both episodes immediately.
+    stuck = torch.tensor([[1, 2, 3, 4], [2, 3, 4, 5],
+                          [3, 4, 5, 6], [4, 5, 6, 7]], dtype=torch.uint8)
+    env.boards[0] = stuck
+    env.boards[1] = stuck
+    env.step(torch.zeros(2, dtype=torch.long))
+
+    logs = env.pop_logs()
+    # Original stream: only the normal episode (scaffold skipped, verbatim)
+    assert logs['n'] == 1 and abs(logs['score'] - 2 ** 14) < 1e-6
+    X = logs['xstats']
+    assert X['xn_scaf'] == 1 and X['xn_norm'] == 1
+    # scaffold episode: reached 32768 without earning anything
+    assert X['xr15_scaf'] == 1 and X['xe15_scaf'] == 0
+    assert X['xr13_scaf'] == 1 and X['xe13_scaf'] == 0
+    # normal episode: earned == reached at 16384, nothing at 32768
+    assert X['xr14_norm'] == 1 and X['xe14_norm'] == 1
+    assert X['xr15_norm'] == 0 and X['xe15_norm'] == 0
+    assert X['xsum_maxtile_scaf'] == 2 ** 15
+    assert X['xsum_earnedmax_norm'] == 2 ** 14
+    assert X['xsum_mergescore_norm'] == 200
+    # accumulators cleared after pop
+    assert env.pop_logs() is None
+    print("  xlog: all episodes tallied, normal/scaffold split, "
+          "earned vs reached separated; original stream untouched")
+
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +520,8 @@ ALL_TESTS = [
     test_scaffolding_branch_low,
     test_scaffolding_branch_high,
     test_add_log_skips_scaffolding_and_updates_lifetime,
+    test_earned_tracking_rule,
+    test_xlog_split_and_counts,
     test_policy_params_and_paths,
     test_advantage_matches_c_kernel,
     test_config_resolution,

@@ -8,6 +8,9 @@ numpy>=1.24
 # original optimizer. (Fallback: `python train.py --optimizer adam`.)
 heavyball==2.1.4
 
+# Plots (report graphs; preinstalled on Kaggle)
+matplotlib>=3.7
+
 # Optional
 # wandb          # only if you pass --wandb
 # pytest         # test_exactness.py also runs standalone via python

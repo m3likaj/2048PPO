@@ -41,11 +41,15 @@ POW15_TABLE = [
 NUM_TILE_VALUES = 18  # exponents 0..17 (empty .. 131072)
 
 
-def slide_and_merge_row(row):
+def slide_and_merge_row(row, merged_out=None):
     """Direct transliteration of slide_and_merge() from g2048.h.
 
     Takes a length-4 list of exponents; returns (new_row, reward,
     score_increase, moved). Slide direction is toward index 0 (LEFT).
+
+    `merged_out`: optional list; every exponent CREATED by a merge in this
+    row is appended to it. Pure bookkeeping for the earned-tile tracker —
+    the game logic above/below this line is untouched C transliteration.
     """
     row = list(row)
     moved = False
@@ -67,6 +71,8 @@ def slide_and_merge_row(row):
     while i < SIZE - 1:
         if row[i] != 0 and row[i] == row[i + 1]:
             row[i] += 1
+            if merged_out is not None:
+                merged_out.append(row[i])
             # Tiles 2-64 (exp 1-6): base reward only
             # Tiles 128+ (exp 7+): base + pow1.5 scaled bonus
             if row[i] <= 6:
@@ -89,24 +95,32 @@ _POW = np.array([NUM_TILE_VALUES ** 3, NUM_TILE_VALUES ** 2, NUM_TILE_VALUES, 1]
 
 
 def build_left_tables():
-    """Enumerate all 18^4 rows through slide_and_merge_row (LEFT direction)."""
+    """Enumerate all 18^4 rows through slide_and_merge_row (LEFT direction).
+
+    Returns (rows, rewards, scores, moved, merge_max) where merge_max[idx]
+    is the largest exponent CREATED by a merge in that row (0 if none) —
+    used only by the earned-tile tracker, never by game logic.
+    """
     n = NUM_TILE_VALUES ** 4
     rows = np.zeros((n, 4), dtype=np.uint8)
     rewards = np.zeros(n, dtype=np.float32)
     scores = np.zeros(n, dtype=np.int32)
     moved = np.zeros(n, dtype=bool)
+    merge_max = np.zeros(n, dtype=np.uint8)
     for idx in range(n):
         r = idx
         c3 = r % 18; r //= 18
         c2 = r % 18; r //= 18
         c1 = r % 18; r //= 18
         c0 = r
-        new_row, rew, sc, mv = slide_and_merge_row([c0, c1, c2, c3])
+        merged = []
+        new_row, rew, sc, mv = slide_and_merge_row([c0, c1, c2, c3], merged)
         rows[idx] = new_row
         rewards[idx] = np.float32(rew)
         scores[idx] = sc
         moved[idx] = mv
-    return rows, rewards, scores, moved
+        merge_max[idx] = max(merged) if merged else 0
+    return rows, rewards, scores, moved, merge_max
 
 
 class G2048TorchEnv:
@@ -130,12 +144,13 @@ class G2048TorchEnv:
         g.manual_seed(int(seed))
         self.gen = g
 
-        rows, rewards, scores, moved = build_left_tables()
+        rows, rewards, scores, moved, merge_max = build_left_tables()
         d = self.device
         self.t_rows = torch.as_tensor(rows, device=d)             # [18^4, 4] uint8
         self.t_rewards = torch.as_tensor(rewards, device=d)       # float32
         self.t_scores = torch.as_tensor(scores, device=d)         # int32
         self.t_moved = torch.as_tensor(moved, device=d)           # bool
+        self.t_merge_max = torch.as_tensor(merge_max, device=d)   # uint8 (earned tracker)
         self.pow_w = torch.as_tensor(_POW, device=d)              # base-18 packing
 
         N = num_envs
@@ -148,6 +163,11 @@ class G2048TorchEnv:
         self.max_tile = torch.zeros(N, dtype=torch.uint8, device=d)        # episode max
         self.lifetime_max_tile = torch.zeros(N, dtype=torch.uint8, device=d)  # init() once
         self.is_scaffolding = torch.zeros(N, dtype=torch.bool, device=d)
+        # Earned-tile tracker (addition, logging-only): largest exponent
+        # CREATED BY A MERGE this episode. Scaffold-placed tiles never set
+        # it; any merge result counts as earned, even when one parent was a
+        # scaffolded tile (e.g. earned 8192 + scaffolded 8192 -> earned 16384).
+        self.earned_max_tile = torch.zeros(N, dtype=torch.uint8, device=d)
 
         # add_log accumulators (Log struct)
         self._log_keys = ['perf', 'score', 'merge_score', 'episode_return',
@@ -156,6 +176,21 @@ class G2048TorchEnv:
                           'reached_131072', 'n']
         self._log = {k: torch.zeros((), dtype=torch.float64, device=d)
                      for k in self._log_keys}
+
+        # Extended log (addition, logging-only): raw SUMS over ALL episodes,
+        # split normal ('norm') / scaffolding ('scaf'). The original add_log
+        # above stays untouched and still skips scaffolding episodes.
+        self.XMILESTONES = (13, 14, 15, 16, 17)   # 8192 .. 131072
+        xkeys = []
+        for cls in ('norm', 'scaf'):
+            xkeys += [f'xn_{cls}', f'xsum_maxtile_{cls}',
+                      f'xsum_earnedmax_{cls}', f'xsum_len_{cls}',
+                      f'xsum_mergescore_{cls}']
+            for m in self.XMILESTONES:
+                xkeys += [f'xr{m}_{cls}', f'xe{m}_{cls}']
+        self._xlog_keys = xkeys
+        self._xlog = {k: torch.zeros((), dtype=torch.float64, device=d)
+                      for k in xkeys}
         self._step_count = 0
 
     # ------------------------------------------------------------------
@@ -234,6 +269,7 @@ class G2048TorchEnv:
         self.moves_made[env_idx] = 0
         self.max_episode_ticks[env_idx] = BASE_MAX_TICKS
         self.max_tile[env_idx] = 0
+        self.earned_max_tile[env_idx] = 0
 
         u = self._rand_uniform(env_idx.numel())
         scaff = u < self.scaffolding_ratio
@@ -287,11 +323,14 @@ class G2048TorchEnv:
         return rows.flip(2)
 
     def _apply_moves(self, actions):
-        """move(): returns (moved, reward, score_gain) and updates boards."""
+        """move(): returns (moved, reward, score_gain, merge_max) and updates
+        boards. merge_max is the largest exponent created by a merge this
+        step (0 if none) -- consumed only by the earned-tile tracker."""
         N = self.num_envs
         moved = torch.zeros(N, dtype=torch.bool, device=self.device)
         reward = torch.zeros(N, dtype=torch.float32, device=self.device)
         score_gain = torch.zeros(N, dtype=torch.int64, device=self.device)
+        merge_max = torch.zeros(N, dtype=torch.uint8, device=self.device)
 
         for direction in range(4):
             sel = (actions == direction).nonzero(as_tuple=True)[0]
@@ -303,9 +342,10 @@ class G2048TorchEnv:
             reward[sel] = self.t_rewards[idx].sum(dim=1)
             score_gain[sel] = self.t_scores[idx].long().sum(dim=1)
             moved[sel] = self.t_moved[idx].any(dim=1)
+            merge_max[sel] = self.t_merge_max[idx].amax(dim=1)
             self.boards[sel] = self._restore_orientation(new_rows, direction)
 
-        return moved, reward, score_gain
+        return moved, reward, score_gain, merge_max
 
     def _is_game_over(self):
         """is_game_over(): board full and no adjacent equal pair."""
@@ -343,23 +383,57 @@ class G2048TorchEnv:
         L['reached_131072'] += (mt >= 17).double().sum()
         L['n'] += env_idx.numel()
 
+    def _add_xlog(self, env_idx):
+        """Extended log (addition): tallies for ALL finished episodes, split
+        normal/scaffolding, with earned milestones. Raw sums, no means."""
+        if env_idx.numel() == 0:
+            return
+        scaf = self.is_scaffolding[env_idx]
+        for cls, mask in (('norm', ~scaf), ('scaf', scaf)):
+            idx = env_idx[mask]
+            if idx.numel() == 0:
+                continue
+            mt = self.max_tile[idx].long()
+            emt = self.earned_max_tile[idx].long()
+            X = self._xlog
+            X[f'xn_{cls}'] += idx.numel()
+            X[f'xsum_maxtile_{cls}'] += (1 << mt).double().sum()
+            X[f'xsum_earnedmax_{cls}'] += (1 << emt).double().sum()
+            X[f'xsum_len_{cls}'] += self.tick[idx].double().sum()
+            X[f'xsum_mergescore_{cls}'] += self.score[idx].double().sum()
+            for m in self.XMILESTONES:
+                X[f'xr{m}_{cls}'] += (mt >= m).double().sum()
+                X[f'xe{m}_{cls}'] += (emt >= m).double().sum()
+
     def pop_logs(self):
-        """binding.vec_log(): mean per episode over the accumulation window."""
+        """binding.vec_log(): mean per episode over the accumulation window.
+        Original keys are untouched; extended raw sums ride along under
+        'xstats' (addition, logging-only)."""
         n = self._log['n'].item()
-        if n == 0:
+        xn = (self._xlog['xn_norm'] + self._xlog['xn_scaf']).item()
+        if n == 0 and xn == 0:
             return None
-        out = {k: (self._log[k].item() / n) for k in self._log_keys if k != 'n'}
-        out['n'] = n
-        for k in self._log:
-            self._log[k].zero_()
-        return out
+        out = {}
+        if n > 0:
+            out = {k: (self._log[k].item() / n)
+                   for k in self._log_keys if k != 'n'}
+            out['n'] = n
+            for k in self._log:
+                self._log[k].zero_()
+        if xn > 0:
+            out['xstats'] = {k: self._xlog[k].item() for k in self._xlog_keys}
+            for k in self._xlog:
+                self._xlog[k].zero_()
+        return out if out else None
 
     # ------------------------------------------------------------------
     def step(self, actions):
         """c_step(): move -> spawn -> tick limits -> terminal -> auto-reset."""
         actions = actions.to(self.device).long().view(-1)
-        moved, reward, score_gain = self._apply_moves(actions)
+        moved, reward, score_gain, merge_max = self._apply_moves(actions)
         self.tick += 1
+        # Earned tracker: any merge result counts as earned this episode.
+        self.earned_max_tile = torch.maximum(self.earned_max_tile, merge_max)
 
         midx = moved.nonzero(as_tuple=True)[0]
         if midx.numel() > 0:
@@ -387,6 +461,7 @@ class G2048TorchEnv:
 
         done_idx = terminals.nonzero(as_tuple=True)[0]
         self._add_log(done_idx)
+        self._add_xlog(done_idx)
         self._reset_envs(done_idx)
 
         self._step_count += 1
