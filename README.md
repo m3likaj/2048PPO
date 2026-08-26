@@ -132,6 +132,20 @@ Definition note: "reached" keeps the original `max_tile` semantics
 (recomputed on valid moves), so an episode terminated purely by invalid
 moves logs `max_tile = 0` exactly as the C code would.
 
+**Proof the logging is inert.** The tracker never draws from the RNG and
+never touches reward, observation, terminal, or optimizer state, so it
+cannot move the training trajectory. `--no-earned-tracking` disables the
+whole addition as an ablation switch, and `test_logging_inert.py` proves
+the claim: under a fixed seed, a run with tracking on and a run with it off
+produce (a) a bit-for-bit identical environment rollout and (b) bit-for-bit
+identical policy weights after several full collection+PPO+optimizer epochs
+(`max |delta| = 0.0` across all 3.47M parameters). So if you compare two
+*full* runs and see differences, that is expected seed/GPU nondeterminism
+(deviation #2), not the logging. To compare two runs as cleanly as
+possible, use the same `--seed` and identical config on both; even then GPU
+reductions are not bitwise reproducible across sessions, so judge
+divergence against normal seed-to-seed noise, not against zero.
+
 ## Deviations from the original (complete list)
 
 Everything not listed here is a faithful recreation. These are the only
@@ -182,6 +196,99 @@ differences, all forced by the port target or disclosed conveniences:
    (~20 progress blocks), and `plot_training.py`. Logging-only: no RNG,
    reward, observation, or optimizer-path change; the original log stream
    is unchanged (verified by tests).
+
+## Attention encoder experiment (addition, opt-in)
+
+`--encoder` selects the encoder; **everything else is frozen** — the value and
+position embeddings, `decode_actions`, the value head, `LSTMWrapper`, the
+trainer, and every hyperparameter. Only how the 16 board tokens are *mixed*
+changes.
+
+| `--encoder` | What it is | Params |
+|---|---|---|
+| `mlp` (default) | choe's faithful baseline: flatten 48 → 1024 → 512 → 512 | 3,466,859 |
+| `attention` | self-attention over the 16 cells, then flatten → 512 | 3,204,267 |
+| `mlp_matched` | baseline architecture resized to match `attention` | 3,204,311 |
+
+```bash
+python train.py                                   # baseline, unchanged
+python train.py --encoder attention               # d_model 64, 1 layer, 4 heads
+python train.py --encoder attention --d-model 96 --n-layers 2 --n-heads 8
+python train.py --encoder mlp_matched             # capacity control
+```
+
+Design notes:
+
+- **Tokens are choe's own** `value_embed(18,3) + pos_embed(16,3)` — 16 tokens
+  of dim 3 — projected up to `d_model` because 3 dims is far too narrow to
+  split across heads. Positional information is not optional: self-attention
+  is permutation-invariant and 2048 is entirely about geometry, so the
+  existing `pos_embed` is what keeps the encoder position-aware (there is a
+  test asserting a shuffled board produces a different encoding).
+- **Sequence length is 16**, so every efficiency-oriented attention variant
+  (sparse/linear/flash/windowed) is irrelevant here; this is plain multi-head
+  self-attention, pre-LN, with a 4× feedforward and a trailing GELU so the
+  LSTM sees the same output activation as the baseline.
+- **Attention sits 7.6% BELOW the baseline in parameters**, so it cannot win
+  on capacity. `mlp_matched` (within 44 params of `attention`) is the control
+  that separates "attention helps" from "this parameter count helps" — run
+  all three at the same seed and budget.
+- **Memory**: attention needs roughly 2 GB more than the MLP at the standard
+  32,768-row minibatch (fine on a T4; it will OOM on a small CPU box).
+- Checkpoints record their encoder config, so `eval.py` rebuilds the right
+  architecture automatically.
+
+For a fair comparison, hold seed, `--total-timesteps`, `--num-envs`,
+scaffolding, and reward fixed across arms, and judge on the **earned**
+milestone rates (and a scaffolding-off `eval.py`), not on `episode_return`.
+Because GPU RNG is not bitwise reproducible (deviation #2), a single run's
+edge can be noise — use several seeds per arm at a reduced-but-complete
+schedule for screening, then promote the winner to a full-budget run.
+
+### Running the comparison (`sweep.py`)
+
+`sweep.py` runs every (encoder, seed) arm at an identical budget, `num_envs`,
+scaffolding, reward and hyperparameters — encoder and seed are the only
+things that vary. It is built for Kaggle's session limit: each arm gets a
+stable directory name, `--session-hours` stops cleanly before the kernel is
+killed, and re-running the same command **skips finished arms and resumes
+partial ones**.
+
+```bash
+# One cell per Kaggle session; re-run it each session until everything is DONE.
+python sweep.py --budget 1e9 --seeds 42 43 --session-hours 11 \
+    --data-dir /kaggle/working/experiments_sweep
+
+python sweep.py --report --budget 1e9 --seeds 42 43 \
+    --data-dir /kaggle/working/experiments_sweep
+```
+
+Arms run **seed-major** (all three encoders for seed 42, then seed 43), so an
+interrupted sweep still leaves you a complete comparison rather than one
+finished arm and two empty ones. A failed arm is recorded and the sweep
+continues; failures are listed loudly in the report.
+
+**Screening budget.** A short run is still a *complete* cosine schedule
+(`T_max` is shaped to `--budget`), so reduced-budget runs are valid, not
+truncated. Anchored to a measured ~95k SPS at `--num-envs 4096`
+(262,144 steps/epoch):
+
+| budget | epochs | ~h/run | earned 8k / 16k signal | 3 arms × 3 seeds |
+|---|---|---|---|---|
+| 1.0e9 | 3,815 | ~2.9 | 1.2% / 0.04% | ~26h |
+| 1.5e9 | 5,722 | ~4.4 | 2.5% / 0.13% | ~40h |
+| 2.0e9 | 7,629 | ~5.8 | 4.3% / 0.42% | ~53h |
+
+(Signal column = what the full run actually logged at that step count.)
+1.0e9 is the sensible screen — it fits a week of free Kaggle GPU and gives a
+clear earned-8k separation; 2.0e9 if you want earned-16k to carry the
+comparison too. Attention is slower per step than the MLP, so its arms take
+more wall-clock at the same budget — compare on **steps, not time**.
+
+Start with 2 seeds; add a third later by re-running with
+`--seeds 42 43 44` (finished arms are skipped, only the new seed runs).
+The report prints per-seed rows plus per-arm mean ± stdev, and refuses to
+let you read much into a single seed.
 
 ## Plugging in a transformer later
 

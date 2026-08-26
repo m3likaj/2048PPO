@@ -96,15 +96,24 @@ class Trainer:
             seed=cfg['seed'],
             device=cfg['device'],
             log_interval=cfg['log_interval'],
+            track_earned=cfg.get('track_earned', True),
         )
 
         self.policy = make_policy(
             hidden_size=cfg['hidden_size'],
             rnn_input_size=cfg['rnn_input_size'],
             rnn_hidden_size=cfg['rnn_hidden_size'],
+            encoder=cfg.get('encoder', 'mlp'),
+            d_model=cfg.get('d_model', 64),
+            n_layers=cfg.get('n_layers', 1),
+            n_heads=cfg.get('n_heads', 4),
         ).to(device)
         n_params = sum(p.numel() for p in self.policy.parameters())
-        print(f'Policy parameters: {n_params:,}')
+        enc = cfg.get('encoder', 'mlp')
+        desc = (f"{enc} (d_model={cfg.get('d_model')}, "
+                f"layers={cfg.get('n_layers')}, heads={cfg.get('n_heads')})"
+                if enc == 'attention' else enc)
+        print(f'Encoder: {desc} | Policy parameters: {n_params:,}')
 
         self.optimizer = make_optimizer(self.policy, cfg)
         eta_min = cfg['learning_rate'] * cfg['min_lr_ratio']
@@ -305,6 +314,18 @@ class Trainer:
         Cumulative earned/reached milestone percentages come WITH raw counts
         so tiny rates (e.g. 0.002%) are never rounded away.
         """
+        if not self.cfg.get('track_earned', True):
+            self.reports_written += 1
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            block = (f"[{ts}] report {self.reports_written:2d} | "
+                     f"epoch {self.epoch}/{self.cfg['total_epochs']} | "
+                     f"step {self.global_step:.4e} | "
+                     f"earned tracking OFF (ablation run)\n")
+            with open(report_path, 'a') as f:
+                f.write(block)
+            print(block, end='', flush=True)
+            return
+
         C = self.xcum
         n_norm, n_scaf = C['xn_norm'], C['xn_scaf']
         n_all = n_norm + n_scaf
@@ -398,6 +419,27 @@ def parse_args():
                    help='Load policy weights only (mirrors PufferLib).')
     p.add_argument('--resume', type=str, default=None,
                    help='Full resume: policy + optimizer + scheduler + epoch.')
+    p.add_argument('--encoder', type=str, default='mlp',
+                   choices=['mlp', 'attention', 'mlp_matched'],
+                   help="Encoder architecture. 'mlp' is the faithful baseline "
+                        "(default); 'attention' swaps ONLY the encoder; "
+                        "'mlp_matched' is the parameter-matched MLP control.")
+    p.add_argument('--d-model', type=int, default=64,
+                   help='Attention token width (3-dim tokens are projected up).')
+    p.add_argument('--n-layers', type=int, default=1,
+                   help='Number of attention blocks.')
+    p.add_argument('--n-heads', type=int, default=4)
+    p.add_argument('--max-hours', type=float, default=None,
+                   help='Stop cleanly after this many wall-clock hours, '
+                        'checkpointing first (for Kaggle/SLURM session limits).')
+    p.add_argument('--run-name', type=str, default=None,
+                   help='Fixed run directory name (default: auto timestamped). '
+                        'A stable name makes runs resumable by name.')
+    p.add_argument('--no-earned-tracking', action='store_true',
+                   help='Ablation switch: disable the earned-tile/extended '
+                        'logging addition entirely. A run with this flag must '
+                        'match a normal run bit-for-bit under the same seed, '
+                        'proving the logging never touched training.')
     p.add_argument('--wandb', action='store_true')
     p.add_argument('--wandb-project', type=str, default='g2048-recreation')
     p.add_argument('--tag', type=str, default='pg2048')
@@ -414,9 +456,15 @@ def main():
     cfg['device'] = args.device
     cfg['optimizer'] = args.optimizer
     cfg['checkpoint_interval'] = args.checkpoint_interval
+    cfg['track_earned'] = not args.no_earned_tracking
+    cfg['encoder'] = args.encoder
+    cfg['d_model'] = args.d_model
+    cfg['n_layers'] = args.n_layers
+    cfg['n_heads'] = args.n_heads
     cfg = resolve(cfg)
 
-    run_name = f"g2048_{args.tag}_seed{cfg['seed']}_{int(time.time())}"
+    run_name = args.run_name or \
+        f"g2048_{args.tag}_seed{cfg['seed']}_{int(time.time())}"
     run_dir = os.path.join(args.data_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
@@ -469,8 +517,17 @@ def main():
 
     xkeys = trainer.env._xlog_keys
     last_report_epoch = -1
+    wall_start = time.time()
+    stopped_early = False
 
     while trainer.global_step < cfg['total_timesteps']:
+        # Graceful stop before a Kaggle/SLURM session is killed: checkpoint
+        # and exit cleanly so --resume picks up exactly here.
+        if args.max_hours and (time.time() - wall_start) / 3600 >= args.max_hours:
+            stopped_early = True
+            print(f'\nReached --max-hours ({args.max_hours}h) at epoch '
+                  f'{trainer.epoch}; checkpointing and exiting cleanly.')
+            break
         trainer.evaluate()
         losses = trainer.train_epoch()
 
@@ -531,8 +588,15 @@ def main():
 
     if last_report_epoch != trainer.epoch:
         trainer.write_report(report_path, losses)   # final report
-    path = trainer.checkpoint(f'model_{trainer.epoch:06d}_final.pt')
-    print(f'Training complete. Final checkpoint -> {path}')
+    if stopped_early:
+        path = trainer.checkpoint(f'model_{trainer.epoch:06d}.pt')
+        print(f'Paused at epoch {trainer.epoch}. Checkpoint -> {path}')
+    else:
+        path = trainer.checkpoint(f'model_{trainer.epoch:06d}_final.pt')
+        # DONE marker: the sweep runner uses this to skip finished runs.
+        with open(os.path.join(run_dir, 'DONE'), 'w') as f:
+            f.write(f'{trainer.epoch} {trainer.global_step}\n')
+        print(f'Training complete. Final checkpoint -> {path}')
     try:
         from plot_training import make_plots
         outs = make_plots(csv_path, os.path.join(run_dir, 'plots'))
