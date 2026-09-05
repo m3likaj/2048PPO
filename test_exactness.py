@@ -442,6 +442,67 @@ def test_policy_params_and_paths():
           "sample_logits matches Categorical")
 
 
+def test_encoder_variants():
+    """The attention encoder is an ADDITION: the baseline must be untouched,
+    the swap must be confined to encode_observations, and the parameter-matched
+    MLP control must actually match."""
+    from g2048_policy import count_params
+
+    torch.manual_seed(42)
+    base = make_policy()
+    assert count_params(base) == 3_466_859, 'baseline params changed!'
+
+    # Baseline construction is bit-identical to the pre-experiment code path:
+    # same classes, same RNG draw order.
+    torch.manual_seed(42)
+    base2 = make_policy(encoder='mlp')
+    for p, q in zip(base.parameters(), base2.parameters()):
+        assert torch.equal(p, q)
+
+    attn = make_policy(encoder='attention')
+    matched = make_policy(encoder='mlp_matched')
+    n_a, n_m = count_params(attn), count_params(matched)
+    # Attention must not win on capacity: it sits BELOW the baseline.
+    assert n_a < 3_466_859, (n_a,)
+    # The control must match attention closely (<0.1%).
+    assert abs(n_m - n_a) / n_a < 1e-3, (n_a, n_m)
+
+    # Everything downstream of the encoder is shared and unchanged.
+    for m in (attn, matched):
+        assert m.policy.decoder[0].weight.shape == base.policy.decoder[0].weight.shape
+        assert m.policy.value[0].weight.shape == base.policy.value[0].weight.shape
+        assert m.hidden_size == base.hidden_size
+        assert isinstance(m.lstm, torch.nn.LSTM)
+
+    # Encoder output keeps the 512-dim interface the LSTM requires, and the
+    # train (TT=1) and eval paths agree for every variant.
+    B = 5
+    obs = torch.randint(0, 18, (B, 16), dtype=torch.uint8)
+    for name, m in (('mlp', base), ('attention', attn), ('mlp_matched', matched)):
+        enc = m.policy.encode_observations(obs)
+        assert enc.shape == (B, 512), (name, enc.shape)
+        h0, c0 = torch.randn(B, 512), torch.randn(B, 512)
+        s_e = dict(lstm_h=h0.clone(), lstm_c=c0.clone())
+        le, ve = m.forward_eval(obs, s_e)
+        s_t = dict(lstm_h=h0.clone().unsqueeze(0), lstm_c=c0.clone().unsqueeze(0))
+        lt, vt = m.forward(obs.unsqueeze(1), s_t)
+        assert torch.allclose(le, lt, atol=1e-5), name
+        assert torch.allclose(ve.flatten(), vt.flatten(), atol=1e-5), name
+
+    # Attention is permutation-SENSITIVE (positional information survives) --
+    # if this failed, the encoder would be blind to board geometry.
+    o1 = torch.randint(1, 12, (1, 16), dtype=torch.uint8)
+    o2 = o1[:, torch.randperm(16)]
+    e1 = attn.policy.encode_observations(o1)
+    e2 = attn.policy.encode_observations(o2)
+    assert not torch.allclose(e1, e2, atol=1e-4), \
+        'attention encoder ignores position -- board geometry lost'
+
+    print(f'  encoders: baseline {3_466_859:,} (unchanged) | attention {n_a:,} '
+          f'| matched-MLP {n_m:,} (within {abs(n_m-n_a)} params); '
+          'all emit 512-dim, forward==forward_eval, attention is position-aware')
+
+
 # ---------------------------------------------------------------------------
 # 6. Advantage kernel vs scalar C transliteration
 # ---------------------------------------------------------------------------
@@ -523,6 +584,7 @@ ALL_TESTS = [
     test_earned_tracking_rule,
     test_xlog_split_and_counts,
     test_policy_params_and_paths,
+    test_encoder_variants,
     test_advantage_matches_c_kernel,
     test_config_resolution,
 ]

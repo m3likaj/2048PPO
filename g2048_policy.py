@@ -220,8 +220,150 @@ def sample_logits(logits, action=None):
     return action.squeeze(0), logprob.squeeze(0), logits_entropy.squeeze(0)
 
 
-def make_policy(hidden_size=512, rnn_input_size=512, rnn_hidden_size=512):
-    """policy_name = G2048, rnn_name = Recurrent (g2048.ini [base])."""
-    policy = G2048Policy(num_actions=4, hidden_size=hidden_size)
+# ---------------------------------------------------------------------------
+# Attention encoder (ADDITION -- experiment only; `--encoder mlp` is untouched)
+#
+# Swaps ONLY G2048Policy.encoder / encode_observations. Everything downstream
+# is frozen: decode_actions, the value head, LSTMWrapper, the trainer, and
+# every hyperparameter. The tokens fed to attention are choe's own
+# value_embed + pos_embed (16 tokens of dim 3), so the only thing that changes
+# is how those 16 tokens are MIXED: flatten+MLP vs self-attention.
+#
+# Positional information is NOT optional here (self-attention is permutation
+# invariant and 2048 is entirely about geometry); it comes from the existing
+# pos_embed, exactly as in the baseline.
+# ---------------------------------------------------------------------------
+
+class AttentionBlock(nn.Module):
+    """Standard pre-LN transformer block over the 16 board cells."""
+
+    def __init__(self, d_model, n_heads, ff_mult=4):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_mult * d_model),
+            nn.GELU(),
+            nn.Linear(ff_mult * d_model, d_model),
+        )
+
+    def forward(self, x):
+        h = self.ln1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class G2048AttentionPolicy(G2048Policy):
+    """G2048Policy with the flatten+MLP encoder replaced by self-attention.
+
+    Sequence length is 16, so no efficiency-oriented attention variant is
+    relevant; this is plain multi-head self-attention.
+    """
+
+    def __init__(self, num_actions=4, hidden_size=512, d_model=64,
+                 n_layers=1, n_heads=4, ff_mult=4):
+        super().__init__(num_actions=num_actions, hidden_size=hidden_size)
+        assert d_model % n_heads == 0, 'd_model must be divisible by n_heads'
+        self.d_model, self.n_layers, self.n_heads = d_model, n_layers, n_heads
+
+        # 3-dim tokens are very narrow for multi-head attention -> project up.
+        self.token_proj = layer_init(nn.Linear(self.embed_dim, d_model))
+        self.blocks = nn.ModuleList(
+            [AttentionBlock(d_model, n_heads, ff_mult) for _ in range(n_layers)])
+        # Flatten the 16 attended tokens back to the 512-dim interface the
+        # LSTM expects. Trailing GELU matches the baseline encoder's output
+        # activation, so the LSTM sees comparable statistics.
+        self.out_proj = layer_init(nn.Linear(self.num_grid_cell * d_model,
+                                             hidden_size))
+        self.out_act = nn.GELU()
+        del self.encoder      # the MLP encoder is replaced, not stacked
+
+    def encode_observations(self, observations, state=None):
+        value_obs = self.value_embed(observations.long())         # [B, 16, 3]
+        pos_obs = self.pos_embed.weight.expand(*value_obs.shape)
+        x = self.token_proj(value_obs + pos_obs)                  # [B, 16, d]
+        for blk in self.blocks:
+            x = blk(x)
+        return self.out_act(self.out_proj(x.flatten(1)))          # [B, 512]
+
+
+class G2048MatchedMLPPolicy(G2048Policy):
+    """Baseline architecture with the first encoder layer resized so the total
+    parameter count matches a given target (the attention model).
+
+    This is the capacity control: if the attention model wins, this says
+    whether it won because of attention or because of parameter count.
+    """
+
+    def __init__(self, num_actions=4, hidden_size=512, hidden1=None,
+                 target_params=None):
+        super().__init__(num_actions=num_actions, hidden_size=hidden_size)
+        if hidden1 is None:
+            assert target_params is not None, 'need hidden1 or target_params'
+            hidden1 = solve_matched_hidden1(target_params, hidden_size,
+                                            self.num_obs)
+        self.hidden1 = hidden1
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Flatten(),
+            layer_init(nn.Linear(self.num_obs, hidden1)),
+            nn.GELU(),
+            layer_init(nn.Linear(hidden1, hidden_size)),
+            nn.GELU(),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+
+
+def solve_matched_hidden1(target_total_params, hidden_size=512, num_obs=48):
+    """Pick encoder width h1 so the FULL policy hits target_total_params.
+
+    Encoder params(h1) = (num_obs+1)*h1 + (h1+1)*hidden + (hidden+1)*hidden,
+    and everything outside the encoder is fixed, so this is linear in h1.
+    """
+    fixed = count_params(make_policy(hidden_size=hidden_size)) - \
+        encoder_params_mlp(1024, hidden_size, num_obs)
+    per_h1 = (num_obs + 1) + hidden_size
+    const = hidden_size * hidden_size + hidden_size + hidden_size
+    h1 = round((target_total_params - fixed - const) / per_h1)
+    return max(1, h1)
+
+
+def encoder_params_mlp(h1, hidden_size=512, num_obs=48):
+    return ((num_obs + 1) * h1 + (h1 + 1) * hidden_size
+            + (hidden_size + 1) * hidden_size)
+
+
+def count_params(module):
+    return sum(p.numel() for p in module.parameters())
+
+
+def make_policy(hidden_size=512, rnn_input_size=512, rnn_hidden_size=512,
+                encoder='mlp', d_model=64, n_layers=1, n_heads=4,
+                matched_hidden1=None):
+    """policy_name = G2048, rnn_name = Recurrent (g2048.ini [base]).
+
+    encoder='mlp' is the faithful baseline and the default -- the attention
+    options are an additive experiment and change nothing when unused.
+    """
+    if encoder == 'mlp':
+        policy = G2048Policy(num_actions=4, hidden_size=hidden_size)
+    elif encoder == 'attention':
+        policy = G2048AttentionPolicy(
+            num_actions=4, hidden_size=hidden_size, d_model=d_model,
+            n_layers=n_layers, n_heads=n_heads)
+    elif encoder == 'mlp_matched':
+        if matched_hidden1 is None:
+            target = count_params(make_policy(
+                hidden_size, rnn_input_size, rnn_hidden_size,
+                encoder='attention', d_model=d_model, n_layers=n_layers,
+                n_heads=n_heads))
+            matched_hidden1 = solve_matched_hidden1(target, hidden_size)
+        policy = G2048MatchedMLPPolicy(num_actions=4, hidden_size=hidden_size,
+                                       hidden1=matched_hidden1)
+    else:
+        raise ValueError(f'Unknown encoder: {encoder}')
     return LSTMWrapper(policy, obs_shape=(16,), input_size=rnn_input_size,
                        hidden_size=rnn_hidden_size)

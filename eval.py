@@ -30,9 +30,16 @@ def evaluate(checkpoint, num_envs=4096, min_episodes=5000, device=None,
                         seed=seed, device=device,
                         log_interval=CONFIG['log_interval'])
 
-    policy = make_policy(CONFIG['hidden_size'], CONFIG['rnn_input_size'],
-                         CONFIG['rnn_hidden_size']).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    # Rebuild whatever architecture this checkpoint was trained with
+    # (checkpoints record their config; older ones default to the baseline).
+    ck_cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
+    policy = make_policy(CONFIG['hidden_size'], CONFIG['rnn_input_size'],
+                         CONFIG['rnn_hidden_size'],
+                         encoder=ck_cfg.get('encoder', 'mlp'),
+                         d_model=ck_cfg.get('d_model', 64),
+                         n_layers=ck_cfg.get('n_layers', 1),
+                         n_heads=ck_cfg.get('n_heads', 4)).to(device)
     state = ckpt['policy'] if 'policy' in ckpt else ckpt
     policy.load_state_dict(state)
     policy.eval()

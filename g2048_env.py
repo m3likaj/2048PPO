@@ -132,11 +132,18 @@ class G2048TorchEnv:
     """
 
     def __init__(self, num_envs, scaffolding_ratio=0.0, seed=0,
-                 device='cpu', log_interval=128):
+                 device='cpu', log_interval=128, track_earned=True):
         self.num_envs = num_envs
         self.scaffolding_ratio = float(scaffolding_ratio)
         self.device = torch.device(device)
         self.log_interval = log_interval
+        # track_earned=False makes the earned-tile/extended-log addition a
+        # complete no-op (an ablation switch to prove the logging is inert:
+        # a run with it off must match a run with it on, bit-for-bit, under a
+        # fixed seed). It never gates any RNG draw, so toggling it cannot
+        # shift the training trajectory -- which is exactly what the switch
+        # lets you verify empirically.
+        self.track_earned = bool(track_earned)
         self.single_observation_shape = (16,)
         self.num_actions = 4
 
@@ -433,7 +440,10 @@ class G2048TorchEnv:
         moved, reward, score_gain, merge_max = self._apply_moves(actions)
         self.tick += 1
         # Earned tracker: any merge result counts as earned this episode.
-        self.earned_max_tile = torch.maximum(self.earned_max_tile, merge_max)
+        # Pure bookkeeping on already-computed tensors; no RNG, no effect on
+        # reward/obs/terminal below. Skipped entirely when track_earned=False.
+        if self.track_earned:
+            self.earned_max_tile = torch.maximum(self.earned_max_tile, merge_max)
 
         midx = moved.nonzero(as_tuple=True)[0]
         if midx.numel() > 0:
@@ -461,7 +471,8 @@ class G2048TorchEnv:
 
         done_idx = terminals.nonzero(as_tuple=True)[0]
         self._add_log(done_idx)
-        self._add_xlog(done_idx)
+        if self.track_earned:
+            self._add_xlog(done_idx)
         self._reset_envs(done_idx)
 
         self._step_count += 1
